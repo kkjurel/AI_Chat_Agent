@@ -71,23 +71,28 @@ async def handle_new_message(event):
     if not sender:
         return
 
-    # Filter messages so we only reply to the girlfriend
-    target_username = (GIRLFRIEND_USERNAME or "").lstrip('@').lower()
+    # Filter messages so we reply to the girlfriend or any other allowed usernames/phone numbers
+    allowed_targets = [u.strip().lstrip('@').lower() for u in (GIRLFRIEND_USERNAME or "").split(",") if u.strip()]
     sender_username = (sender.username or "").lower()
     sender_phone = getattr(sender, 'phone', '') or ""
 
-    is_girlfriend = False
-    if target_username and sender_username == target_username:
-        is_girlfriend = True
-    elif GIRLFRIEND_USERNAME and (GIRLFRIEND_USERNAME in sender_phone or sender_phone == GIRLFRIEND_USERNAME):
-        is_girlfriend = True
+    is_allowed = False
+    for target in allowed_targets:
+        # Check username match
+        if sender_username == target:
+            is_allowed = True
+            break
+        # Check phone number match
+        if target in sender_phone or sender_phone == target:
+            is_allowed = True
+            break
 
-    if not is_girlfriend:
+    if not is_allowed:
         return
 
     chat_id = str(event.chat_id)
     user_message = event.text
-    logger.info(f"Girlfriend messaged: {user_message}")
+    logger.info(f"Received message from {sender_username or sender_phone}: {user_message}")
 
     # Send "typing" indicator continuously while creating response
     async with client.action(event.chat_id, 'typing'):

@@ -1,0 +1,9 @@
+telethon
+python-dotenv
+google-genai
+absl-py
+mcp
+protobuf
+pydantic
+uvicorn
+websockets

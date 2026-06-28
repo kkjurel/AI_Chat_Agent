@@ -1,0 +1,21 @@
+# Environment variables (Sensitive API keys)
+.env
+
+# Telegram session files (Sensitive credentials)
+*.session
+sessions/
+session_name.session
+
+# Python cache and virtual environment
+__pycache__/
+venv/
+.venv/
+*.pyc
+
+# Local ZIP archives
+bot.zip
+
+# Windows binary executables
+*.exe
+google/antigravity/bin/
+

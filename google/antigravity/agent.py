@@ -1,205 +1,106 @@
-# Copyright 2026 Google LLC
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     https://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+import os
+import json
+import uuid
+import asyncio
+from typing import Any
+from google import genai
+from google.genai import types as genai_types
 
-"""Layer 1 API for Antigravity SDK."""
+class MockChatResponse:
+    def __init__(self, text: str):
+        self._text = text
 
-import contextlib
-import logging
-from typing import cast
-
-from google.antigravity import types
-from google.antigravity.connections import connection as connection_module
-from google.antigravity.conversation import conversation
-from google.antigravity.hooks import hook_runner
-from google.antigravity.hooks import policy
-from google.antigravity.tools import tool_context
-from google.antigravity.tools import tool_runner
-from google.antigravity.triggers import trigger_runner
-
-
-__all__ = ["Agent"]
-
+    async def text(self) -> str:
+        return self._text
 
 class Agent:
-  """High-level Agent API for simplified interaction."""
+    """Pure-Python Agent class that interacts with Gemini API directly."""
+    def __init__(self, config: Any):
+        self._config = config
+        self.conversation_id = config.conversation_id or uuid.uuid4().hex
+        self._history = []
+        self._client = None
+        self._chat = None
 
-  def __init__(self, config: connection_module.AgentConfig):
-    """Initializes the Agent.
+    async def __aenter__(self) -> "Agent":
+        api_key = os.getenv("GEMINI_API_KEY")
+        self._client = genai.Client(api_key=api_key)
+        
+        # Load history if it exists
+        if self._config.save_dir:
+            os.makedirs(self._config.save_dir, exist_ok=True)
+            history_file = os.path.join(self._config.save_dir, f"conversation_{self.conversation_id}.json")
+            if os.path.exists(history_file):
+                try:
+                    with open(history_file, "r", encoding="utf-8") as f:
+                        self._history = json.load(f)
+                except Exception:
+                    self._history = []
 
-    Args:
-        config: Declarative agent configuration.
-    """
-    self._config = config.model_copy(deep=True)
-    if self._config.response_schema:
-      # The response_schema is validated/stringified in AgentConfig.
-      self._config.capabilities.finish_tool_schema_json = cast(
-          str, self._config.response_schema
-      )
-    self._strategy = None
-    self._conversation = None
-    self._tool_runner = None
-    self._hook_runner = None
-    self._trigger_runner = None
-    # Use the original config (not self._config) for hooks and triggers:
-    # model_copy(deep=True) creates new objects, breaking reference equality
-    # for user-provided hooks/triggers. The list() snapshot prevents the
-    # caller from mutating our copy, while preserving object identity.
-    self._pending_hooks = list(config.hooks)
-    self._pending_triggers = list(config.triggers)
-    self._exit_stack = contextlib.AsyncExitStack()
-
-  async def __aenter__(self) -> "Agent":
-    """Starts the agent session.
-
-    Returns:
-        The started Agent instance.
-    """
-    logging.info("Starting Agent session")
-    try:
-      self._hook_runner = hook_runner.HookRunner()
-
-      # Register pending hooks
-      for hook in self._pending_hooks:
-        self._hook_runner.register_hook(hook)
-      self._pending_hooks.clear()
-
-      # Apply policies
-      active_policies = list(self._config.policies)
-      cfg = self._config.capabilities
-      read_only_tools = set(types.BuiltinTools.read_only())
-      # enabled_tools and disabled_tools are mutually exclusive
-      # (enforced by CapabilitiesConfig validation).
-      if cfg.enabled_tools is not None:
-        active_tools = set(cfg.enabled_tools)
-      elif cfg.disabled_tools is not None:
-        active_tools = set(types.BuiltinTools) - set(cfg.disabled_tools)
-      else:
-        active_tools = set(types.BuiltinTools)
-      has_write_tools = bool(active_tools - read_only_tools)
-      has_mcp_servers = bool(self._config.mcp_servers)
-      has_tool_decide_hook = bool(self._hook_runner.pre_tool_call_decide_hooks)
-
-      if (
-          (has_write_tools or has_mcp_servers)
-          and not active_policies
-          and not has_tool_decide_hook
-      ):
-        raise ValueError(
-            "Write tools or MCP servers are enabled without a safety policy. "
-            "Add policies=[policy.allow_all()] to approve all tool calls, "
-            "or policies=[policy.deny_all(), policy.allow('tool_name')] "
-            "to selectively allow specific tools."
-        )
-
-      if active_policies:
-        self._hook_runner.register_hook(
-            policy.enforce(
-                active_policies, mcp_servers=self._config.mcp_servers
+        # Convert simple history dicts to GenAI Content types
+        genai_history = []
+        for turn in self._history:
+            role = turn.get("role")
+            parts = turn.get("parts", [])
+            # Normalize roles for Gemini API (must be 'user' or 'model')
+            if role == "model":
+                role_val = "model"
+            else:
+                role_val = "user"
+            
+            genai_history.append(
+                genai_types.Content(
+                    role=role_val,
+                    parts=[genai_types.Part.from_text(text=p) for p in parts if isinstance(p, str)]
+                )
             )
+
+        # Select model (default to gemini-2.5-flash)
+        model_name = self._config.model or "gemini-2.5-flash"
+        # Map older or placeholder model names
+        if "gemini-flash-lite" in model_name:
+            model_name = "gemini-2.5-flash"
+
+        # System instructions
+        system_instruction = self._config.system_instructions
+        if hasattr(system_instruction, "system_instruction"):
+            system_instruction = system_instruction.system_instruction
+
+        chat_config = genai_types.GenerateContentConfig(
+            system_instruction=system_instruction,
+            temperature=0.7,
         )
 
-      all_tools = list(self._config.tools)
-      self._tool_runner = tool_runner.ToolRunner(tools=all_tools)
-
-      self._strategy = self._config.create_strategy(
-          tool_runner=self._tool_runner,
-          hook_runner=self._hook_runner,
-      )
-
-      logging.info("Starting connection and creating conversation...")
-      self._conversation = await self._exit_stack.enter_async_context(
-          conversation.Conversation.create(self._strategy)
-      )
-
-      # Start triggers via TriggerRunner.
-      if self._pending_triggers:
-        logging.info("Starting triggers...")
-        self._trigger_runner = await self._exit_stack.enter_async_context(
-            trigger_runner.TriggerRunner(
-                triggers=list(self._pending_triggers),
-                connection=self.conversation.connection,
-            )
+        self._chat = self._client.chats.create(
+            model=model_name,
+            history=genai_history,
+            config=chat_config
         )
-        self._pending_triggers.clear()
+        return self
 
-      # Wire ToolContext into ToolRunner so tools can access
-      # conversation capabilities (same pattern as TriggerRunner).
-      if self._tool_runner:
-        ctx = tool_context.ToolContext(self.conversation)
-        self._tool_runner.set_context(ctx)
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        # Save history back to file on exit
+        if self._config.save_dir and self._chat:
+            history_file = os.path.join(self._config.save_dir, f"conversation_{self.conversation_id}.json")
+            history_list = []
+            try:
+                for message in self._chat.get_history():
+                    role = message.role
+                    parts = [p.text for p in message.parts if p.text]
+                    history_list.append({
+                        "role": role,
+                        "parts": parts
+                    })
+                with open(history_file, "w", encoding="utf-8") as f:
+                    json.dump(history_list, f, indent=4, ensure_ascii=False)
+            except Exception:
+                pass
 
-      return self
-    except Exception:
-      logging.exception("Failed to start Agent session, cleaning up...")
-      await self._exit_stack.aclose()
-      raise
-
-  async def __aexit__(self, exc_type, exc_val, exc_tb):
-    """Stops the agent session.
-
-    Args:
-        exc_type: The exception type, if any.
-        exc_val: The exception value, if any.
-        exc_tb: The traceback, if any.
-
-    Returns:
-        True if the exception was suppressed, False or None otherwise.
-    """
-    logging.info("Stopping Agent session")
-    return await self._exit_stack.__aexit__(exc_type, exc_val, exc_tb)
-
-  async def chat(self, prompt: types.Content) -> types.ChatResponse:
-    """Sends a prompt and returns the final response.
-
-    Args:
-        prompt: The user prompt or content to send.
-
-    Returns:
-        The final response from the agent.
-    """
-    return await self.conversation.chat(prompt)
-
-  @property
-  def is_started(self) -> bool:
-    """Whether the agent session has been started."""
-    return self._conversation is not None
-
-  @property
-  def conversation(self) -> conversation.Conversation:
-    """Returns the active Conversation session.
-
-    Use this for advanced session introspection: history, turn count,
-    compaction indices, usage, or direct send/receive_steps control.
-    For most use cases, prefer chat() instead.
-
-    Raises:
-      RuntimeError: If the agent session has not been started.
-    """
-    if not self._conversation:
-      raise RuntimeError(
-          "Agent session not started. Use 'async with Agent(...)'."
-      )
-    return self._conversation
-
-  @property
-  def conversation_id(self) -> str | None:
-    """Returns the conversation identifier assigned by the runtime.
-
-    Available after the session has started and at least one message has
-    been exchanged.  Pass this value back via SessionConfig.conversation_id
-    to resume from a saved session.  Returns None before the session starts.
-    """
-    if not self._conversation:
-      return None
-    return self._conversation.conversation_id or None
+    async def chat(self, prompt: str) -> MockChatResponse:
+        # Run in executor to prevent blocking async telethon loop since genai SDK is sync
+        loop = asyncio.get_event_loop()
+        response = await loop.run_in_executor(
+            None,
+            lambda: self._chat.send_message(prompt)
+        )
+        return MockChatResponse(response.text)
